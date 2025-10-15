@@ -1,0 +1,13 @@
+# folders
+__pycache__/
+.vscode/
+.venv/
+venv/
+test/
+tmp/
+
+# files
+*.sh
+*.bat
+*.ps1
+*.json
