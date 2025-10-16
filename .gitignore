@@ -10,4 +10,4 @@ tmp/
 *.sh
 *.bat
 *.ps1
-*.json
+*.json*

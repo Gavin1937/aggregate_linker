@@ -5,6 +5,7 @@ import signal
 import time
 from pathlib import PurePath, Path
 import platform
+import threading # Added for the healing monitor thread
 
 # We use the watchdog library, which internally utilizes inotify on Linux, 
 # for efficient file system monitoring (using ReadDirectoryChangesW on Windows).
@@ -16,6 +17,10 @@ except ImportError:
     print("Please install it using: pip install -r requirements.txt")
     sys.exit(1)
 
+# --- GLOBAL HEALING STATE ---
+HEAL_IDLE_TIMEOUT = 5.0  # Time in seconds the directory must be idle before healing
+HEALING_PATHS = {}       # {Path(target_dir): last_activity_time}
+HEALING_LOCK = threading.Lock()
 # --- CONFIGURATION & UTILITIES ---
 
 CONFIG_FILE = "config.json"
@@ -139,9 +144,10 @@ def load_config():
 def get_directories_to_monitor(config):
     """
     Extracts the unique base directories from the source patterns that Watchdog 
-    needs to monitor.
+    needs to monitor, plus their unique parent directories for self-healing.
     """
-    monitored_dirs = set()
+    target_monitored_dirs = set()
+    parent_monitored_dirs = set()
     
     for src_config in config["SOURCE_CONFIGS"]:
         source_string = src_config.get("PATH", "")
@@ -164,15 +170,18 @@ def get_directories_to_monitor(config):
             if base_dir == base_dir.parent:
                 break
         
-        # Ensure the directory exists before adding it to the monitor list
         monitor_path = base_dir.resolve()
         
         if monitor_path.is_dir() and monitor_path.exists():
-            monitored_dirs.add(monitor_path)
+            target_monitored_dirs.add(monitor_path)
+
+            # Add parent for self-healing, provided it's not the root itself
+            if monitor_path.parent != monitor_path:
+                parent_monitored_dirs.add(monitor_path.parent.resolve())
         else:
             print(f"Warning: Cannot monitor non-existent or invalid directory '{monitor_path}' derived from pattern '{source_string}'.")
             
-    return list(monitored_dirs)
+    return list(target_monitored_dirs), list(parent_monitored_dirs)
 
 
 def should_link(item_path):
@@ -344,36 +353,171 @@ def cleanup(config):
     print("--- Cleanup Complete ---")
 
 
+# --- HEALING MONITOR THREAD ---
+
+class HealingMonitor(threading.Thread):
+    def __init__(self, observer_instance, target_paths):
+        super().__init__()
+        self.observer = observer_instance
+        self.target_paths = target_paths # Set of Path objects we expect to be monitored
+        self._stop_event = threading.Event()
+        self.daemon = True # Allows thread to exit when main thread exits
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _perform_heal_action(self, path_to_heal):
+        """Attempts to re-schedule watcher and re-link contents for an idle path."""
+        if path_to_heal in self.target_paths:
+
+            if path_to_heal.is_dir() and path_to_heal.exists():
+
+                print(f"[HEALING ACTION] Re-scheduling watcher for idle source folder: {path_to_heal.name}")
+                # Note: The handler instance (event_handler) is implicitly scheduled via the observer instance.
+                # We need to ensure we schedule with the correct event handler instance.
+                # Since the handler is coupled with the observer and path, we just re-schedule it.
+                # The observer will handle internal checks if a watcher exists.
+                self.observer.schedule(self.observer.event_handler, str(path_to_heal), recursive=False)
+
+                # Re-run initial link creation for any content that might have been added quickly
+                for item in path_to_heal.iterdir():
+                    if should_link(item):
+                        create_link(item)
+                return True
+        return False
+
+    def run(self):
+        while not self._stop_event.is_set():
+            time.sleep(1) # Check every second
+
+            paths_to_remove = []
+
+            with HEALING_LOCK:
+                current_time = time.time()
+
+                # Use list() to iterate over a copy of keys, allowing modification to HEALING_PATHS
+                for path_to_heal, last_activity in list(HEALING_PATHS.items()):
+
+                    if current_time - last_activity >= HEAL_IDLE_TIMEOUT:
+                        # Path is idle, attempt to heal
+                        if self._perform_heal_action(path_to_heal):
+                            paths_to_remove.append(path_to_heal)
+                        else:
+                            # If healing failed (e.g., dir still deleted), assume it needs future healing
+                            # if it reappears, but stop monitoring its idle state for now.
+                            # We keep it in HEALING_PATHS until healed, but the check handles non-existence.
+                            pass
+
+            # Clean up healed paths outside the lock
+            with HEALING_LOCK:
+                for path in paths_to_remove:
+                    HEALING_PATHS.pop(path, None)
+
+
 # --- INOTIFY/WATCHDOG EVENT HANDLER ---
 
 class SymlinkManagerHandler(FileSystemEventHandler):
     """Handles file system events (created/deleted) in source folders."""
 
+    # Store the monitored directories set for quick lookup
+    def __init__(self, observer_instance, target_paths, parent_paths):
+        super().__init__()
+        self.observer = observer_instance
+        # Paths where files are expected to be created/deleted (Source_A, Source_B)
+        self.target_paths = target_paths # Set of Path objects we expect to be monitored
+        # Paths that are parents of the target paths (for directory re-creation healing)
+        self.parent_paths = parent_paths # Set of Path objects being monitored for directory creation events
+
+    def _mark_for_healing(self, path):
+        """Marks a target path as needing healing due to recent activity."""
+        # Only mark if the path is a known target directory
+        if path in self.target_paths:
+            with HEALING_LOCK:
+                # Update timestamp to the current time, restarting the idle timer
+                HEALING_PATHS[path] = time.time()
+                print(f"[HEALING PENDING] Marked {path.name} for delayed healing.")
+
+
     def on_created(self, event):
         """Called when a file or directory is created."""
-        source_path = Path(event.src_path)
-        
-        # 1. Filter out temp files and ensure the path matches all rules
-        if source_path.name.startswith(".") or not should_link(source_path):
+        source_path = Path(event.src_path).resolve()
+
+        # --- Self-Healing Check (Directory Re-creation) ---
+        # 1. Check if the event occurred in one of the parent directories we're watching.
+        if event.is_directory and source_path.parent.resolve() in self.parent_paths:
+            # 2. Check if the created directory is one of our target paths (i.e., a deleted directory was recreated)
+            if source_path in self.target_paths:
+                self._mark_for_healing(source_path) # Mark for delayed healing (do NOT heal immediately)
+                return
+
+        # --- Regular File/Folder Creation Logic ---
+        # Only process file/folder creation if it happened inside a target monitored path
+        if source_path.parent.resolve() in self.target_paths:
+
+            # Regular file/folder creation logic
+            if source_path.name.startswith(".") or not should_link(source_path):
+                return
+
+            # Give the system a moment to finish writing the file contents.
+            time.sleep(0.1)
+
+            # 3. Create the link
+            create_link(source_path)
+
+    def on_modified(self, event):
+        """Called when a file or directory is modified."""
+        source_path = Path(event.src_path).resolve()
+
+        # --- Self-Healing Check (Directory Modification in Parent) ---
+        # If DirModifiedEvent occurred on a Parent Path, it indicates activity (delete/create cycle).
+        if event.is_directory and source_path in self.parent_paths:
+
+            # Check all known target directories to see if any of them now exist under this modified parent.
+            for target_path in self.target_paths:
+                # If the target path is a child of the modified parent
+                if target_path.parent.resolve() == source_path:
+                    # Mark potential target for healing
+                    self._mark_for_healing(target_path)
             return
-            
-        # 2. Give the system a moment to finish writing the file contents.
-        time.sleep(0.1) 
-        
-        # 3. Create the link
-        create_link(source_path)
+
+        # Regular file modification (ignored since links remain valid)
+        pass
 
     def on_deleted(self, event):
         """Called when a file or directory is deleted."""
-        deleted_name = Path(event.src_path).name
-        delete_link(deleted_name)
+        source_path = Path(event.src_path).resolve()
 
-    # Ignore modified and moved events, as the link remains valid
+        # If a monitored target directory is deleted, ensure it's removed from healing paths
+        # as it can't be healed until recreated. When recreated, the on_created logic will handle it.
+        if event.is_directory and source_path in self.target_paths:
+            print(f"[UN-MONITOR] Source folder deleted: {source_path.name}")
+            with HEALING_LOCK:
+                HEALING_PATHS.pop(source_path, None) # Stop checking for idleness immediately
+
+        # Check if the deleted item was inside a target monitored path
+        if source_path.parent.resolve() in self.target_paths or source_path in self.target_paths:
+            # Delete the corresponding link from the root
+            deleted_name = source_path.name
+            delete_link(deleted_name)
+
     def on_moved(self, event):
-        pass
-    
-    def on_modified(self, event):
-        pass
+        # Handle cases where a monitored directory is moved/renamed, which can also break the watch
+        if event.is_directory and Path(event.src_path).resolve() in self.target_paths:
+            # Unschedule the old path (watch)
+            self.observer.unschedule(event.watch)
+            print(f"[UN-MONITOR] Directory moved/renamed: {event.src_path}")
+            # Reschedule the new path if it's still a directory
+            new_path = Path(event.dest_path)
+            if new_path.is_dir():
+                self.observer.schedule(self, str(new_path), recursive=False)
+                print(f"[RE-MONITOR] Re-scheduled watcher for moved directory: {new_path}")
+
+        # If a file is moved within a monitored directory, we need to delete the old link and create the new one
+        if not event.is_directory:
+            delete_link(Path(event.src_path).name) # Delete old link name
+            new_path = Path(event.dest_path)
+            if should_link(new_path):
+                create_link(new_path) # Create new link name
 
 
 # --- MAIN EXECUTION ---
@@ -392,25 +536,41 @@ def main():
     create_initial_links(config)
 
     # 2. Setup Watchdog Observer
-    event_handler = SymlinkManagerHandler()
     observer = Observer()
     
     # Get the list of unique directories to monitor
-    monitored_dirs = get_directories_to_monitor(config)
+    target_paths, parent_paths = get_directories_to_monitor(config)
     
-    # Schedule an observer for each base directory
-    for monitor_path in monitored_dirs:
-        print(f"Monitoring Directory: {monitor_path}")
+    # 3. Pass the observer and the list of monitored paths to the handler
+    event_handler = SymlinkManagerHandler(observer, set(target_paths), set(parent_paths))
+
+    # Attach handler to observer for use by HealingMonitor
+    observer.event_handler = event_handler
+
+    # 4. Schedule observers
+    for monitor_path in target_paths:
+        print(f"Monitoring Target Directory: {monitor_path}")
+        observer.schedule(event_handler, str(monitor_path), recursive=False)
+
+    for monitor_path in parent_paths:
+        print(f"Monitoring Parent Directory for healing: {monitor_path}")
         observer.schedule(event_handler, str(monitor_path), recursive=False)
         
     observer.start()
+
+    # 5. Start Healing Monitor Thread
+    healing_monitor = HealingMonitor(observer, set(target_paths))
+    healing_monitor.start()
+
     print("Symlink Manager is running. Press CTRL+C to stop.")
 
-    # 3. Handle graceful shutdown (cleanup)
+    # 6. Handle graceful shutdown (cleanup)
     def signal_handler(sig, frame):
         """Handles graceful shutdown on CTRL+C."""
         print('\nShutdown signal received. Stopping observer...')
+        healing_monitor.stop() # Stop the healing thread first
         observer.stop()
+        healing_monitor.join() # Wait for healing thread to finish
         observer.join()
         cleanup(config)
         sys.exit(0)
@@ -426,7 +586,9 @@ def main():
         signal_handler(signal.SIGINT, None)
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
+        healing_monitor.stop()
         observer.stop()
+        healing_monitor.join()
         observer.join()
         cleanup(config)
         sys.exit(1)
