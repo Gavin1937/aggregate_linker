@@ -193,7 +193,7 @@ Result:
 
 ## Handling source folder deletion
 
-aggregate_linker will monitor the parent folder of all the source folder for auto healing. After a source folder get deleted and re-created, aggregate_linker will wait until no more modification happens to the newly created source folder for `HEAL_IDLE_TIMEOUT` seconds, then relink files inside. You can change `HEAL_IDLE_TIMEOUT` variable, default to 5 seconds.
+aggregate_linker will monitor the parent folder of all the source folder for auto healing. After a source folder get deleted and re-created, aggregate_linker will wait until no more modification happens to the newly created source folder for `HEAL_IDLE_TIMEOUT` seconds, then relink files inside. You can change `HEAL_IDLE_TIMEOUT` variable inside [aggregate_linker.py](./aggregate_linker.py) file, default to 5 seconds.
 
 ## 🧩 Cross-Platform Behavior
 
