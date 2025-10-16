@@ -3,6 +3,7 @@ import os
 import sys
 import signal
 import time
+import argparse
 from pathlib import PurePath, Path
 import platform
 import threading # Added for the healing monitor thread
@@ -522,10 +523,28 @@ class SymlinkManagerHandler(FileSystemEventHandler):
 
 # --- MAIN EXECUTION ---
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="A cross-platform Python tool that dynamically aggregates files from multiple source folders into a single unified “root” folder."
+    )
+
+    parser.add_argument(
+        "-c", "--config",
+        metavar="CONFIG_PATH",
+        default="config.json",
+        help="Path to the configuration file (default: config.json)"
+    )
+
+    return parser.parse_args()
+
 def main():
     """Main function to setup and run the symlink manager."""
     global GLOBAL_CONFIG
-    
+    global CONFIG_FILE
+
+    args = parse_args()
+    CONFIG_FILE = args.config
+
     os_name = platform.system()
     print(f"Detected OS: {os_name}")
     if os_name == "Windows":

@@ -89,6 +89,12 @@ After editing the configuration, start the watcher:
 python aggregate_linker.py
 ```
 
+Or use a custom config file path
+
+```bash
+python aggregate_linker.py -c /path/to/my/config.json
+```
+
 Sample output:
 
 ```
